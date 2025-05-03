@@ -13,7 +13,8 @@ use XmlTv\Tv\Source;
 class Magenta implements Source
 {
     private const LANG = 'de';
-    private const CURL_USER_AGENT = 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/114.0';
+    private const CURL_USER_AGENT = 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/118.0';
+    private const CURL_RETRIES = 60;
 
     private const SOURCE_INFO_URL = 'https://tv.magenta.at/epg';
     private const SOURCE_INFO_NAME = 'Magenta';
@@ -21,10 +22,6 @@ class Magenta implements Source
     private const SOURCE = 'https://tv.magenta.at/epg';
     private const SOURCE_CHANNELS = 'https://tv-at-prod.yo-digital.com/at-bifrost/epg/channel';
     private const SOURCE_CHANNEL_INFO = 'https://tv-at-prod.yo-digital.com/at-bifrost/epg/channel/schedules/v2';
-    private const SOURCE_CHANNELS_QUERY = [
-        'app_language' => 'de',
-        'natco_code' => 'at',
-    ];
 
     private Tv $tv;
     private CurlHandle $ch;
@@ -32,6 +29,11 @@ class Magenta implements Source
     private bool $debug;
     private bool $mapChannelIdsToA1;
     private array $configuration = [];
+    private array $sourceChannelsQuery = [
+        'app_language' => 'de',
+        'natco_code' => 'at',
+        'natco_key' => '', // Filled in `load()` function
+    ];
 
     public function __construct(CacheInterface $cache, bool $debug = false, bool $mapChannelIdsToA1 = false)
     {
@@ -91,8 +93,9 @@ class Magenta implements Source
     {
         $html = $this->loadUrl(self::SOURCE);
 
-        if (preg_match('/window\.APP_CONSTANTS = (?<config>{".*"})/m', $html, $matches)) {
+        if (preg_match('/window\.APP_CONSTANTS = (?<config>{.*})/m', $html, $matches)) {
             $this->configuration = json_decode($matches['config'], true);
+            $this->sourceChannelsQuery['natco_key'] = $this->configuration['NATCO_KEY'] ?? '';
         } else {
             throw new \RuntimeException('Could not extract API key from Magenta website');
         }
@@ -106,7 +109,7 @@ class Magenta implements Source
             $this->debug('Loading infos from cache "' . $cacheKey . '"');
             $rawJson = $this->cache->get($cacheKey);
         } else {
-            $url = self::SOURCE_CHANNELS . '?' . http_build_query(self::SOURCE_CHANNELS_QUERY);
+            $url = self::SOURCE_CHANNELS . '?' . http_build_query($this->sourceChannelsQuery);
             $this->debug('Loading infos from URL ' . $url);
             $rawJson = $this->loadUrl($url);
         }
@@ -120,7 +123,7 @@ class Magenta implements Source
         }
     }
 
-    private function loadProgramme($channelId): void
+    private function loadProgramme(string $channelId): void
     {
         $today = date('Y-m-d', time());
         $tomorrow = date("Y-m-d", strtotime('tomorrow'));
@@ -142,6 +145,10 @@ class Magenta implements Source
                 if (is_array($programmes) && array_key_exists('channels', $programmes)) {
                     $this->cache->set($cacheKey, $rawJson);
                     if (count($programmes['channels']) === 0) return;
+                    if (!array_key_exists($channelId, $programmes['channels'])) {
+                        $this->debug('Error: channelId not found in response');
+                        continue;
+                    }
                     $this->addProgrammes($programmes['channels'][$channelId], $channelId);
                 } else {
                     throw new \RuntimeException('Could not decode JSON or invalid response.');
@@ -150,30 +157,47 @@ class Magenta implements Source
         }
     }
 
-    private function loadUrl(string $url): string
+    private function loadUrl(string $url, int $tries = 0): string
     {
+        $headers = [
+            'x-request-tracking-id: 39851468-6227-40c8-9b79-7f9d55722766',
+            'X-User-Agent: web|web|Firefox-118|02.0.800|1',
+        ];
+
+        if (count($this->configuration) > 0) {
+            $headers = [
+                ...$headers,
+                ...[
+                    'app_key: ' . $this->configuration['CMS_CONFIGURATION_API_KEY'] ?? '',
+                    'app_version: ' . $this->configuration['APP_VERSION'] ?? '',
+                    'Device-Id: ' . $this->configuration['DEVICE_ID'] ?? '',
+                ]
+            ];
+        }
+
         curl_setopt($this->ch, CURLOPT_URL, $url);
         curl_setopt($this->ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($this->ch, CURLOPT_USERAGENT, self::CURL_USER_AGENT);
         curl_setopt($this->ch, CURLOPT_ENCODING, '');
-        curl_setopt($this->ch, CURLOPT_HTTPHEADER, [
-            'app_key: ' . $this->configuration['CMS_CONFIGURATION_API_KEY'] ?? '',
-            'app_version: ' . $this->configuration['APP_VERSION'] ?? '',
-            'Device-Id: ' . $this->configuration['DEVICE_ID'] ?? '',
-            'X-User-Agent: web|web|Firefox-114|02.0.660|1',
-        ]);
+        curl_setopt($this->ch, CURLOPT_HTTPHEADER, $headers);
 
         $result = curl_exec($this->ch);
         $error = curl_errno($this->ch);
+        $info = curl_getinfo($this->ch);
+        $status = $info['http_code'];
 
-        if (!$error && $result) {
+        if (!$error && $result && $status >= 200 && $status < 400) {
             return $result;
+        } elseif ($tries < self::CURL_RETRIES) {
+            $this->debug('Loading infos from URL ' . $url . ' failed (' . $status . '). Retrying ... (' . $tries . ')');
+            usleep(1000000 * $tries); // Avoid rate-limiting
+            return $this->loadUrl($url, $tries + 1);
         } else {
-            throw new \RuntimeException('cURL request failed.');
+            throw new \RuntimeException('cURL request failed: ' . $status);
         }
     }
 
-    private function addChannels($data): void
+    private function addChannels(array $data): void
     {
         foreach ($data as $channelInfo) {
             $channel = new Channel($channelInfo['station_id']);
@@ -183,7 +207,7 @@ class Magenta implements Source
         }
     }
 
-    private function addProgrammes($data, $channelId): void
+    private function addProgrammes(array $data, string $channelId): void
     {
         foreach ($data as $programmeInfo) {
             if (empty($programmeInfo)) continue;
@@ -207,7 +231,7 @@ class Magenta implements Source
     private function getChannelInfoUrl(string $id, string $date, int $offset): string
     {
         return self::SOURCE_CHANNEL_INFO . '?' . http_build_query([
-            ...self::SOURCE_CHANNELS_QUERY,
+            ...$this->sourceChannelsQuery,
             'date' => $date,
             'hour_offset' => (string) $offset,
             'hour_range' => '3',
